@@ -565,6 +565,32 @@ type ConnectionMap<C> = connections_container::ConnectionsMap<ConnectionFuture<C
 type ConnectionsContainer<C> =
     self::connections_container::ConnectionsContainer<ConnectionFuture<C>>;
 
+struct SeedConnection<C> {
+    address: String,
+    socket_addr: SocketAddr,
+    connection: ConnectionFuture<C>,
+}
+
+impl<C> Drop for SeedConnection<C> {
+    fn drop(&mut self) {
+        Telemetry::decr_total_connections(1);
+    }
+}
+
+struct SeedConnections<C> {
+    entries: HashMap<String, Arc<SeedConnection<C>>>,
+    closed: bool,
+}
+
+impl<C> Default for SeedConnections<C> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::new(),
+            closed: false,
+        }
+    }
+}
+
 pub(crate) struct InnerCore<C> {
     pub(crate) conn_lock: ParkingLotRwLock<ConnectionsContainer<C>>,
     cluster_params: ParkingLotRwLock<ClusterParams>,
@@ -572,6 +598,9 @@ pub(crate) struct InnerCore<C> {
     pending_requests_rx: std::sync::Mutex<mpsc::UnboundedReceiver<PendingRequest<C>>>,
     slot_refresh_state: SlotRefreshState,
     initial_nodes: Vec<ConnectionInfo>,
+    // Bootstrap aliases need not own slots. Keep only their management sockets,
+    // outside the routable map, and at most one current endpoint per raw seed.
+    seed_connections: ParkingLotRwLock<SeedConnections<C>>,
     glide_connection_options: GlideConnectionOptions,
     /// Lock to ensure mutual exclusion between topology refresh operations and connection validation.
     ///
@@ -754,6 +783,11 @@ pub(crate) struct ClusterConnInner<C> {
 
 impl<C> Dispose for ClusterConnInner<C> {
     fn dispose(mut self) {
+        {
+            let mut cache = self.inner.seed_connections.write();
+            cache.closed = true;
+            cache.entries.clear();
+        }
         if let Some(conn_lock) = self.inner.conn_lock.try_read() {
             // Each node may contain user and *maybe* a management connection
             let mut count = 0usize;
@@ -1258,6 +1292,7 @@ mod iam_token_refresh_tests {
             ),
             initial_nodes: Vec::new(),
             glide_connection_options: options_with_provider(provider),
+            seed_connections: Default::default(),
             topology_refresh_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -1793,6 +1828,7 @@ where
             slot_refresh_state: SlotRefreshState::new(slots_refresh_rate_limiter),
             initial_nodes: initial_nodes.to_vec(),
             glide_connection_options,
+            seed_connections: Default::default(),
             topology_refresh_lock: tokio::sync::Mutex::new(()),
         });
         let mut connection = ClusterConnInner {
@@ -1843,39 +1879,12 @@ where
     pub(crate) async fn try_to_expand_initial_nodes(
         initial_nodes: &[ConnectionInfo],
     ) -> Vec<(String, Option<SocketAddr>)> {
-        stream::iter(initial_nodes)
-            .fold(
-                Vec::with_capacity(initial_nodes.len()),
-                |mut acc, info| async {
-                    let (host, port) = match &info.addr {
-                        crate::ConnectionAddr::Tcp(host, port) => (host, port),
-                        crate::ConnectionAddr::TcpTls {
-                            host,
-                            port,
-                            insecure: _,
-                            tls_params: _,
-                        } => (host, port),
-                        crate::ConnectionAddr::Unix(_) => {
-                            // We don't support multiple addresses for a Unix address. Store the initial node address and continue
-                            acc.push((info.addr.to_string(), None));
-                            return acc;
-                        }
-                    };
-                    match get_socket_addrs(host, *port).await {
-                        Ok(socket_addrs) => {
-                            for addr in socket_addrs {
-                                acc.push((info.addr.to_string(), Some(addr)));
-                            }
-                        }
-                        Err(_) => {
-                            // Couldn't find socket addresses, store the initial node address and continue
-                            acc.push((info.addr.to_string(), None));
-                        }
-                    };
-                    acc
-                },
-            )
-            .await
+        expand_initial_nodes_with_lookup(initial_nodes, None, |host, port| async move {
+            get_socket_addrs(&host, port)
+                .await
+                .map(|addresses| addresses.collect())
+        })
+        .await
     }
 
     async fn create_initial_connections(
@@ -1883,9 +1892,17 @@ where
         params: &ClusterParams,
         glide_connection_options: GlideConnectionOptions,
     ) -> RedisResult<ConnectionMap<C>> {
-        let expanded = Self::try_to_expand_initial_nodes(initial_nodes).await;
-        let initial_nodes =
-            prepare_initial_connection_addresses(expanded, params.address_resolver.as_deref());
+        let initial_nodes = expand_initial_nodes_with_lookup(
+            initial_nodes,
+            params.address_resolver.as_deref(),
+            |host, port| async move {
+                get_socket_addrs(&host, port)
+                    .await
+                    .map(|addresses| addresses.collect())
+            },
+        )
+        .await;
+        let initial_nodes = prepare_initial_connection_addresses(initial_nodes, None);
         let connections =
             stream::iter(initial_nodes.iter().cloned())
                 .map(|(node_addr, socket_addr)| {
@@ -4314,6 +4331,42 @@ where
     }
 }
 
+async fn expand_initial_nodes_with_lookup<F, Fut>(
+    initial_nodes: &[ConnectionInfo],
+    resolver: Option<&dyn crate::AddressResolver>,
+    lookup: F,
+) -> Vec<(String, Option<SocketAddr>)>
+where
+    F: Fn(String, u16) -> Fut,
+    Fut: Future<Output = RedisResult<Vec<SocketAddr>>>,
+{
+    let addresses = initial_nodes
+        .iter()
+        .map(|info| (info.addr.to_string(), None))
+        .collect();
+    let addresses = if resolver.is_some() {
+        prepare_initial_connection_addresses(addresses, resolver)
+    } else {
+        addresses
+    };
+    let mut expanded = Vec::new();
+    for (address, _) in addresses {
+        let Some((host, port)) = parse_cluster_address(&address) else {
+            expanded.push((address, None));
+            continue;
+        };
+        match lookup(host.to_owned(), port).await {
+            Ok(sockets) => expanded.extend(
+                sockets
+                    .into_iter()
+                    .map(|socket| (address.clone(), Some(socket))),
+            ),
+            Err(_) => expanded.push((address, None)),
+        }
+    }
+    expanded
+}
+
 fn prepare_initial_connection_addresses(
     initial_nodes: Vec<(String, Option<SocketAddr>)>,
     resolver: Option<&dyn crate::types::AddressResolver>,
@@ -4575,10 +4628,224 @@ struct InitialNodeConnectionsResult<C> {
     connections: Vec<(String, Shared<Pin<Box<dyn Future<Output = C> + Send>>>)>,
     /// Addresses that need connection refresh (exists in slot map but not in connection map)
     addresses_needing_refresh: HashSet<ClusterAddress>,
+    seed_connections: HashSet<String>,
+}
+
+async fn lookup_seed_sockets(host: String, port: u16) -> RedisResult<Vec<SocketAddr>> {
+    get_socket_addrs(&host, port)
+        .await
+        .map(|addresses| addresses.collect())
+}
+
+async fn resolved_seed_connection<C, F, Fut>(
+    inner: &Core<C>,
+    seeds: &[String],
+    address: &ReadyToDialAddress,
+    lookup: F,
+) -> RedisResult<(String, ConnectionFuture<C>, bool)>
+where
+    C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
+    F: Fn(String, u16) -> Fut,
+    Fut: Future<Output = RedisResult<Vec<SocketAddr>>>,
+{
+    let endpoint = address.as_str().to_owned();
+    let (host, port) = parse_cluster_address(&endpoint).ok_or_else(|| {
+        RedisError::from((ErrorKind::InvalidClientConfig, "Invalid seed address"))
+    })?;
+    let sockets = lookup(host.to_owned(), port).await?;
+    // Preserve the prepared TLS identity AND verify that a reused peer is still
+    // among its current DNS answers. Never match topology nodes by IP alone.
+    let existing = inner
+        .conn_lock
+        .read()
+        .node_for_address(&endpoint)
+        .and_then(|node| {
+            let details = node
+                .management_connection
+                .as_ref()
+                .unwrap_or(&node.user_connection);
+            details
+                .ip
+                .filter(|ip| sockets.contains(&SocketAddr::new(*ip, port)))
+                .map(|_| details.conn.clone())
+        });
+    if let Some(connection) = existing {
+        let mut cache = inner.seed_connections.write();
+        for seed in seeds {
+            cache.entries.remove(seed);
+        }
+        return Ok((endpoint, connection, false));
+    }
+    let cached = {
+        let mut cache = inner.seed_connections.write();
+        for seed in seeds {
+            if cache.entries.get(seed).is_some_and(|entry| {
+                entry.address != endpoint || !sockets.contains(&entry.socket_addr)
+            }) {
+                cache.entries.remove(seed);
+            }
+        }
+        cache
+            .entries
+            .values()
+            .find(|entry| entry.address == endpoint && sockets.contains(&entry.socket_addr))
+            .cloned()
+    };
+    let cached = match cached {
+        Some(entry) if entry.connection.clone().await.is_closed() => {
+            inner
+                .seed_connections
+                .write()
+                .entries
+                .retain(|_, cached| !Arc::ptr_eq(cached, &entry));
+            None
+        }
+        entry => entry,
+    };
+    let entry = match cached {
+        Some(entry) => entry,
+        None => {
+            ClusterConnInner::refresh_iam_token_in_cluster_params(inner).await;
+            ClusterConnInner::refresh_cert_params_in_cluster_params(inner).await;
+            let params = inner.get_cluster_param(|params| params.clone());
+            let mut last_error =
+                RedisError::from((ErrorKind::IoError, "No address found for seed"));
+            let mut permission_error = None;
+            let mut connected = None;
+            let mut candidates = stream::iter(sockets)
+                .map(|socket_addr| {
+                    let params = params.clone();
+                    async move {
+                        connections_logic::connect_seed_management::<C>(
+                            address,
+                            params,
+                            socket_addr,
+                            inner.glide_connection_options.clone(),
+                        )
+                        .await
+                        .map(|connection| (socket_addr, connection))
+                    }
+                })
+                .buffer_unordered(8);
+            while let Some(result) = candidates.next().await {
+                match result {
+                    Ok(connection) => {
+                        connected = Some(connection);
+                        break;
+                    }
+                    Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+                        permission_error = Some(error)
+                    }
+                    Err(error) => last_error = error,
+                }
+            }
+            let (socket_addr, connection) =
+                connected.ok_or_else(|| permission_error.unwrap_or(last_error))?;
+            Telemetry::incr_total_connections(1);
+            Arc::new(SeedConnection {
+                address: endpoint.clone(),
+                socket_addr,
+                connection,
+            })
+        }
+    };
+    {
+        let mut cache = inner.seed_connections.write();
+        if cache.closed {
+            return Err((ErrorKind::ClientError, "Cluster client is closed").into());
+        }
+        for seed in seeds {
+            cache.entries.insert(seed.clone(), entry.clone());
+        }
+    }
+    Ok((endpoint, entry.connection.clone(), true))
+}
+
+async fn get_resolved_seed_connections<C>(
+    inner: &Core<C>,
+    num_of_nodes_to_query: usize,
+    resolver: &dyn crate::AddressResolver,
+) -> RedisResult<InitialNodeConnectionsResult<C>>
+where
+    C: ConnectionLike + Connect + Clone + Send + Sync + 'static,
+{
+    if inner.seed_connections.read().closed {
+        return Err((ErrorKind::ClientError, "Cluster client is closed").into());
+    }
+    let seeds = {
+        let mut rng = rand::rng();
+        inner
+            .initial_nodes
+            .iter()
+            .map(|node| node.addr.to_string())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .choose_multiple(&mut rng, num_of_nodes_to_query)
+    };
+    let deadline = tokio::time::Instant::now()
+        .checked_add(inner.get_cluster_param(|params| params.connection_timeout));
+    let mut groups = HashMap::<String, Vec<String>>::new();
+    for seed in seeds {
+        let address = ClusterAddress::Raw(seed.clone()).prepare(Some(resolver));
+        {
+            let mut cache = inner.seed_connections.write();
+            if cache
+                .entries
+                .get(&seed)
+                .is_some_and(|entry| entry.address != address.as_str())
+            {
+                cache.entries.remove(&seed);
+            }
+        }
+        groups
+            .entry(address.as_str().to_owned())
+            .or_default()
+            .push(seed);
+    }
+    let mut attempts = stream::iter(groups)
+        .map(|(endpoint, seeds)| async move {
+            let address = ReadyToDialAddress::new(endpoint);
+            let attempt = resolved_seed_connection(inner, &seeds, &address, lookup_seed_sockets);
+            match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, attempt)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(
+                            io::Error::new(io::ErrorKind::TimedOut, "Seed discovery timed out")
+                                .into(),
+                        )
+                    }),
+                None => attempt.await,
+            }
+        })
+        .buffer_unordered(8);
+    let mut connections = Vec::new();
+    let mut seed_connections = HashSet::new();
+    while let Some(result) = attempts.next().await {
+        match result {
+            Ok((endpoint, connection, owned)) => {
+                if owned {
+                    seed_connections.insert(endpoint.clone());
+                }
+                connections.push((endpoint, connection));
+            }
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => return Err(error),
+            _ => {}
+        }
+    }
+    Ok(InitialNodeConnectionsResult {
+        connections,
+        addresses_needing_refresh: HashSet::new(),
+        seed_connections,
+    })
 }
 
 /// Returns connections found for randomly selected initial nodes, along with addresses
 /// that needs to be refreshed.
+///
+/// Custom resolvers prepare selected raw seeds first and use a separate cache of
+/// management connections. The DNS lookup/retry path below applies when no custom
+/// resolver is configured.
 ///
 /// # Lookup and Retry Logic
 ///
@@ -4614,6 +4881,11 @@ where
             ErrorKind::InvalidClientConfig,
             "Cannot refresh topology from initial nodes: no initial nodes configured",
         )));
+    }
+
+    if let Some(resolver) = inner.get_cluster_param(|params| params.address_resolver.clone()) {
+        return get_resolved_seed_connections(inner, num_of_nodes_to_query, resolver.as_ref())
+            .await;
     }
 
     // Resolve initial nodes and select random addresses for topology query.
@@ -4688,6 +4960,7 @@ where
     Ok(InitialNodeConnectionsResult {
         connections,
         addresses_needing_refresh,
+        seed_connections: HashSet::new(),
     })
 }
 
@@ -4835,12 +5108,15 @@ where
         use_initial_nodes_lookup, num_of_nodes_to_query, trigger, curr_retry));
 
     // Get connections either from seed nodes or random existing connections.
+    let mut seed_connections = HashSet::new();
     let (requested_nodes, mut failed_addresses) = if use_initial_nodes_lookup {
         match get_random_connections_from_initial_nodes(inner, num_of_nodes_to_query).await {
             Ok(InitialNodeConnectionsResult {
                 connections,
                 addresses_needing_refresh,
+                seed_connections: owned_seeds,
             }) => {
+                seed_connections = owned_seeds;
                 if connections.is_empty() {
                     log_info_lazy!("slot_refresh",
                         "Initial nodes returned no connections, falling back to existing cluster connections");
@@ -4858,6 +5134,12 @@ where
                 }
             }
             Err(err) => {
+                if err.kind() == ErrorKind::PermissionDenied {
+                    return TopologyQueryResult {
+                        topology_result: Err(err),
+                        failed_connections: None,
+                    };
+                }
                 log_info_lazy!("slot_refresh",
                     format!("Initial nodes query failed ({}), falling back to existing cluster connections", err));
                 if let Some(random_conns) = inner
@@ -4897,13 +5179,30 @@ where
             (addr, res)
         }))
         .await;
+    let num_of_nodes_to_query = if use_initial_nodes_lookup
+        && inner.get_cluster_param(|params| params.address_resolver.is_some())
+    {
+        topology_join_results.len()
+    } else {
+        num_of_nodes_to_query
+    };
 
+    // Seed-only sockets are retried by the next discovery, not routing-node recovery.
+    for (address, result) in &topology_join_results {
+        if result.is_err() && seed_connections.contains(address) {
+            inner
+                .seed_connections
+                .write()
+                .entries
+                .retain(|_, entry| &entry.address != address);
+        }
+    }
     // Add topology command failures (with unrecoverable errors) to the existing connection failures set.
     failed_addresses.extend(
         topology_join_results
             .iter()
             .filter_map(|(address, res)| match res {
-                Err(err) if err.is_unrecoverable_error() => {
+                Err(err) if err.is_unrecoverable_error() && !seed_connections.contains(address) => {
                     Some(ClusterAddress::ReadyToDial(address.clone()))
                 }
                 _ => None,
@@ -5679,6 +5978,7 @@ mod circular_moved_address_normalization_tests {
             ),
             initial_nodes: Vec::new(),
             glide_connection_options: GlideConnectionOptions::default(),
+            seed_connections: Default::default(),
             topology_refresh_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -5775,6 +6075,7 @@ mod circular_moved_address_normalization_tests {
             ),
             initial_nodes: Vec::new(),
             glide_connection_options: GlideConnectionOptions::default(),
+            seed_connections: Default::default(),
             topology_refresh_lock: tokio::sync::Mutex::new(()),
         });
 
@@ -5908,6 +6209,27 @@ pub(super) mod refresh_task_resolution_tests {
         assert_eq!(candidates, vec![("127.0.0.1:6382".to_owned(), None)]);
         assert_eq!(resolver.0.load(Ordering::SeqCst), 1);
     }
+
+    #[tokio::test]
+    async fn custom_seed_is_prepared_before_dns_lookup() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = CountingHostnameResolver(calls.clone());
+        let seed = "redis://seed.example:6379".into_connection_info().unwrap();
+        let addresses = expand_initial_nodes_with_lookup(&[seed], Some(&resolver), |host, port| {
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            assert_eq!((host.as_str(), port), ("reachable.example", 6382));
+            async { Ok(vec!["127.0.0.1:6382".parse().unwrap()]) }
+        })
+        .await;
+        assert_eq!(
+            addresses,
+            vec![(
+                "reachable.example:6382".to_owned(),
+                Some("127.0.0.1:6382".parse().unwrap())
+            )]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
     // RecordingConnection uses process-wide gates because Connect has no test
     // context. Serialize the tests which exercise those gates and remove
     // permits left by a previous test before starting.
@@ -6003,6 +6325,7 @@ pub(super) mod refresh_task_resolution_tests {
         while let Ok(permit) = RELEASE_POISON_CONNECT.try_acquire() {
             permit.forget();
         }
+        while POISON_CONNECT_STARTED.notified().now_or_never().is_some() {}
         guard
     }
 
@@ -6056,6 +6379,7 @@ pub(super) mod refresh_task_resolution_tests {
             ),
             initial_nodes: Vec::new(),
             glide_connection_options: GlideConnectionOptions::default(),
+            seed_connections: Default::default(),
             topology_refresh_lock: tokio::sync::Mutex::new(()),
         });
         resolver.0.store(0, Ordering::SeqCst);
@@ -6092,8 +6416,36 @@ pub(super) mod refresh_task_resolution_tests {
     }
 
     impl ConnectionLike for RecordingConnection {
-        fn req_packed_command<'a>(&'a mut self, _cmd: &'a Cmd) -> RedisFuture<'a, Value> {
-            Box::pin(async { Ok(Value::Okay) })
+        fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
+            Box::pin(async move {
+                if self.port == 6399 && cmd.arg_idx(0) == Some(b"CLIENT".as_slice()) {
+                    return Err((ErrorKind::PermissionDenied, "connection naming denied").into());
+                }
+                if cmd.arg_idx(0) == Some(b"CLUSTER".as_slice()) {
+                    match self.port {
+                        6397 => {
+                            return Err(
+                                (ErrorKind::FatalReceiveError, "seed transport closed").into()
+                            )
+                        }
+                        6398 => {
+                            return Err((ErrorKind::PermissionDenied, "seed topology denied").into())
+                        }
+                        6400 => {
+                            return Ok(Value::Array(vec![Value::Array(vec![
+                                Value::Int(0),
+                                Value::Int(16383),
+                                Value::Array(vec![
+                                    Value::BulkString(b"127.0.0.1".to_vec().into()),
+                                    Value::Int(6400),
+                                ]),
+                            ])]))
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Value::Okay)
+            })
         }
 
         fn req_packed_commands<'a>(
@@ -6120,7 +6472,7 @@ pub(super) mod refresh_task_resolution_tests {
             info: T,
             _response_timeout: Duration,
             _connection_timeout: Duration,
-            _socket_addr: Option<SocketAddr>,
+            socket_addr: Option<SocketAddr>,
             _glide_connection_options: GlideConnectionOptions,
         ) -> RedisFuture<'a, (Self, Option<IpAddr>)>
         where
@@ -6133,7 +6485,10 @@ pub(super) mod refresh_task_resolution_tests {
                     ConnectionAddr::Unix(_) => unreachable!("cluster test uses TCP addresses"),
                 };
 
-                if port == 6381 {
+                if port == 6381
+                    || socket_addr
+                        .is_some_and(|addr| addr.ip() == "192.0.2.1".parse::<IpAddr>().unwrap())
+                {
                     POISON_CONNECT_STARTED.notify_one();
                     RELEASE_POISON_CONNECT
                         .acquire()
@@ -6228,6 +6583,7 @@ pub(super) mod refresh_task_resolution_tests {
             ),
             initial_nodes: Vec::new(),
             glide_connection_options: GlideConnectionOptions::default(),
+            seed_connections: Default::default(),
             topology_refresh_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -6281,6 +6637,7 @@ pub(super) mod refresh_task_resolution_tests {
             ),
             initial_nodes: Vec::new(),
             glide_connection_options: GlideConnectionOptions::default(),
+            seed_connections: Default::default(),
             topology_refresh_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -6363,10 +6720,421 @@ pub(super) mod refresh_task_resolution_tests {
     fn recording_node(port: u16) -> ClusterNode<ConnectionFuture<RecordingConnection>> {
         let connection = ConnectionDetails {
             conn: async move { RecordingConnection { port } }.boxed().shared(),
-            ip: None,
+            ip: Some("127.0.0.1".parse().unwrap()),
             az: None,
         };
         ClusterNode::new(connection.clone(), Some(connection))
+    }
+
+    #[tokio::test]
+    async fn seed_refresh_resolves_before_reusing_a_healthy_connection() {
+        #[derive(Debug)]
+        struct SwitchingResolver(AtomicUsize);
+        impl AddressResolver for SwitchingResolver {
+            fn resolve(&self, host: &str, port: u16) -> (String, u16) {
+                assert_eq!((host, port), ("127.0.0.1", 6379));
+                let port = self.0.load(Ordering::SeqCst) as u16;
+                let host = if port == 6383 { "localhost" } else { host };
+                (host.to_owned(), port)
+            }
+        }
+
+        let resolver = Arc::new(SwitchingResolver(AtomicUsize::new(6382)));
+        let mut core = core_with_resolver(resolver.clone());
+        Arc::get_mut(&mut core).unwrap().initial_nodes =
+            vec!["redis://127.0.0.1:6379".into_connection_info().unwrap()];
+        // Keep even a raw-address match healthy: it must not bypass the callback.
+        let connections = ConnectionsMap(DashMap::new());
+        for port in [6379, 6382, 6383] {
+            let host = if port == 6383 {
+                "localhost"
+            } else {
+                "127.0.0.1"
+            };
+            connections
+                .0
+                .insert(format!("{host}:{port}"), recording_node(port));
+        }
+        core.conn_lock.write().extend_connection_map(connections);
+        core.conn_lock.write().slot_map = SlotMap::new(
+            vec![Slot::new(0, 16383, "127.0.0.1:6379".to_owned(), vec![])],
+            HashMap::from([("127.0.0.1:6379".to_owned(), "127.0.0.1".parse().unwrap())]),
+            ReadFromReplicaStrategy::AlwaysFromPrimary,
+        );
+        // 6384 is not installed yet: preparation must also survive connection creation.
+        let mut obsolete = None;
+        for port in [6382, 6383, 6384, 6382] {
+            resolver.0.store(port, Ordering::SeqCst);
+            let result = get_random_connections_from_initial_nodes(&core, 1)
+                .await
+                .unwrap();
+            assert!(result.addresses_needing_refresh.is_empty());
+            assert_eq!(result.connections.len(), 1);
+            let (address, connection) = result.connections.into_iter().next().unwrap();
+            let host = if port == 6383 {
+                "localhost"
+            } else {
+                "127.0.0.1"
+            };
+            assert_eq!(address, format!("{host}:{port}"));
+            assert_eq!(connection.await.port, port as u16);
+            if port == 6384 {
+                obsolete = Some(Arc::downgrade(
+                    core.seed_connections
+                        .read()
+                        .entries
+                        .get("127.0.0.1:6379")
+                        .unwrap(),
+                ));
+            }
+        }
+        assert!(core.seed_connections.read().entries.is_empty());
+        assert!(obsolete.unwrap().upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_connection_survives_validation_without_becoming_routable() {
+        let mut core = core_with_resolver(Arc::new(SeedAddressResolver));
+        Arc::get_mut(&mut core).unwrap().initial_nodes =
+            vec!["redis://127.0.0.1:6379".into_connection_info().unwrap()];
+        let first = get_random_connections_from_initial_nodes(&core, 1)
+            .await
+            .unwrap()
+            .connections
+            .pop()
+            .unwrap()
+            .1;
+        assert!(core
+            .conn_lock
+            .read()
+            .connection_for_address("127.0.0.1:6382")
+            .is_none());
+        ClusterConnInner::validate_all_user_connections(core.clone()).await;
+        *core.conn_lock.write() = ConnectionsContainer::default();
+        let second = get_random_connections_from_initial_nodes(&core, 1)
+            .await
+            .unwrap()
+            .connections
+            .pop()
+            .unwrap()
+            .1;
+        assert!(
+            first.ptr_eq(&second),
+            "unchanged bootstrap endpoint must reuse its connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn equivalent_bootstrap_seeds_share_one_management_connection() {
+        #[derive(Debug)]
+        struct SameTarget;
+        impl AddressResolver for SameTarget {
+            fn resolve(&self, _: &str, _: u16) -> (String, u16) {
+                ("127.0.0.1".into(), 6382)
+            }
+        }
+        let mut core = core_with_resolver(Arc::new(SameTarget));
+        Arc::get_mut(&mut core).unwrap().initial_nodes = vec![
+            "redis://first.invalid:6379".into_connection_info().unwrap(),
+            "redis://second.invalid:6379"
+                .into_connection_info()
+                .unwrap(),
+        ];
+        let result = get_random_connections_from_initial_nodes(&core, 2)
+            .await
+            .unwrap();
+        assert_eq!(result.connections.len(), 1);
+        let entries: Vec<_> = core
+            .seed_connections
+            .read()
+            .entries
+            .values()
+            .cloned()
+            .collect();
+        assert_eq!(entries.len(), 2);
+        assert!(Arc::ptr_eq(&entries[0], &entries[1]));
+        assert!(core
+            .conn_lock
+            .read()
+            .refresh_conn_state
+            .refresh_address_in_progress
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn equivalent_bootstrap_seeds_share_connections_across_discoveries() {
+        #[derive(Debug)]
+        struct SameTarget;
+        impl AddressResolver for SameTarget {
+            fn resolve(&self, _: &str, _: u16) -> (String, u16) {
+                ("127.0.0.1".into(), 6382)
+            }
+        }
+        let mut core = core_with_resolver(Arc::new(SameTarget));
+        // Restrict the fixture to one seed per call for deterministic sampling.
+        for seed in ["first.invalid", "second.invalid"] {
+            Arc::get_mut(&mut core).unwrap().initial_nodes = vec![format!("redis://{seed}:6379")
+                .into_connection_info()
+                .unwrap()];
+            get_random_connections_from_initial_nodes(&core, 1)
+                .await
+                .unwrap();
+        }
+        let entries: Vec<_> = core
+            .seed_connections
+            .read()
+            .entries
+            .values()
+            .cloned()
+            .collect();
+        assert_eq!(entries.len(), 2);
+        assert!(Arc::ptr_eq(&entries[0], &entries[1]));
+    }
+
+    #[tokio::test]
+    async fn closed_seed_cache_cannot_be_repopulated() {
+        let mut core = core_with_resolver(Arc::new(SeedAddressResolver));
+        Arc::get_mut(&mut core).unwrap().initial_nodes =
+            vec!["redis://127.0.0.1:6379".into_connection_info().unwrap()];
+        get_random_connections_from_initial_nodes(&core, 1)
+            .await
+            .unwrap();
+        let entry = Arc::downgrade(
+            core.seed_connections
+                .read()
+                .entries
+                .values()
+                .next()
+                .unwrap(),
+        );
+        {
+            let mut cache = core.seed_connections.write();
+            cache.closed = true;
+            cache.entries.clear();
+        }
+        assert!(entry.upgrade().is_none());
+        assert!(get_random_connections_from_initial_nodes(&core, 1)
+            .await
+            .is_err());
+        assert!(core.seed_connections.read().entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn closing_during_bootstrap_connect_does_not_repopulate_cache() {
+        let _guard = gated_test_guard().await;
+        let mut core = core_with_non_idempotent_resolver();
+        Arc::get_mut(&mut core).unwrap().initial_nodes =
+            vec!["redis://127.0.0.1:6380".into_connection_info().unwrap()];
+        let task_core = core.clone();
+        let pending =
+            tokio::spawn(
+                async move { get_random_connections_from_initial_nodes(&task_core, 1).await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), POISON_CONNECT_STARTED.notified())
+            .await
+            .unwrap();
+        {
+            let mut cache = core.seed_connections.write();
+            cache.closed = true;
+            cache.entries.clear();
+        }
+        RELEASE_POISON_CONNECT.add_permits(1);
+        let result = tokio::time::timeout(Duration::from_secs(1), pending)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(result.connections.is_empty());
+        assert!(core.seed_connections.read().entries.is_empty());
+        assert_eq!(Arc::strong_count(&core), 1);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_cache_rechecks_dns_for_an_unchanged_hostname() {
+        let core = core_with_resolver(Arc::new(SeedAddressResolver));
+        let address = ReadyToDialAddress::new("bootstrap.example:6382".into());
+        let seeds = vec!["managed.invalid:6379".to_owned()];
+        let mut previous = None;
+        for socket in ["127.0.0.1:6382", "127.0.0.2:6382", "127.0.0.2:6382"] {
+            let socket: SocketAddr = socket.parse().unwrap();
+            let (_, connection, owned) =
+                resolved_seed_connection(&core, &seeds, &address, |host, port| {
+                    assert_eq!((host.as_str(), port), ("bootstrap.example", 6382));
+                    async move { Ok(vec![socket]) }
+                })
+                .await
+                .unwrap();
+            assert!(owned);
+            if let Some((last_socket, last_connection)) = previous {
+                assert_eq!(connection.ptr_eq(&last_connection), socket == last_socket);
+            }
+            previous = Some((socket, connection));
+        }
+        assert_eq!(core.seed_connections.read().entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_naming_is_optional_but_topology_is_not() {
+        let mut core = core_with_resolver(Arc::new(SeedAddressResolver));
+        Arc::get_mut(&mut core).unwrap().initial_nodes =
+            vec!["redis://127.0.0.1:6399".into_connection_info().unwrap()];
+        let result = get_random_connections_from_initial_nodes(&core, 1)
+            .await
+            .unwrap();
+        assert_eq!(result.connections.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deduplicated_seed_endpoints_use_the_actual_query_count() {
+        #[derive(Debug)]
+        struct SameTarget;
+        impl AddressResolver for SameTarget {
+            fn resolve(&self, _: &str, _: u16) -> (String, u16) {
+                ("127.0.0.1".into(), 6400)
+            }
+        }
+        let mut core = core_with_resolver(Arc::new(SameTarget));
+        Arc::get_mut(&mut core).unwrap().initial_nodes = (0..6)
+            .map(|i| {
+                format!("redis://seed-{i}.invalid:6379")
+                    .into_connection_info()
+                    .unwrap()
+            })
+            .collect();
+        core.cluster_params
+            .write()
+            .refresh_topology_from_initial_nodes = true;
+        let result =
+            calculate_topology_from_random_nodes(&core, 6, 0, SlotRefreshTrigger::RuntimeRefresh)
+                .await;
+        result.topology_result.unwrap();
+        assert_eq!(core.seed_connections.read().entries.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn seed_discovery_handles_a_stalled_first_dns_candidate() {
+        let _guard = gated_test_guard().await;
+        let core = core_with_resolver(Arc::new(SeedAddressResolver));
+        let address = ReadyToDialAddress::new("bootstrap.example:6382".into());
+        let seeds = vec!["managed.invalid:6379".to_owned()];
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            resolved_seed_connection(&core, &seeds, &address, |_, _| async {
+                Ok(vec![
+                    "192.0.2.1:6382".parse().unwrap(),
+                    "127.0.0.1:6382".parse().unwrap(),
+                ])
+            }),
+        )
+        .await
+        .expect("a stalled candidate must not block a healthy alternative")
+        .unwrap();
+        assert_eq!(result.1.await.port, 6382);
+        assert_eq!(
+            core.seed_connections
+                .read()
+                .entries
+                .values()
+                .next()
+                .unwrap()
+                .socket_addr,
+            "127.0.0.1:6382".parse().unwrap()
+        );
+        assert!(POISON_CONNECT_STARTED.notified().now_or_never().is_some());
+    }
+
+    #[tokio::test]
+    async fn seed_discovery_handles_an_unlimited_connection_timeout() {
+        let mut core = core_with_resolver(Arc::new(SeedAddressResolver));
+        Arc::get_mut(&mut core).unwrap().initial_nodes =
+            vec!["redis://127.0.0.1:6379".into_connection_info().unwrap()];
+        core.cluster_params.write().connection_timeout = Duration::MAX;
+        let result = get_random_connections_from_initial_nodes(&core, 1)
+            .await
+            .unwrap();
+        assert_eq!(result.connections.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn blocked_seed_does_not_delay_other_selected_seeds() {
+        let _guard = gated_test_guard().await;
+        let mut core = core_with_non_idempotent_resolver();
+        Arc::get_mut(&mut core).unwrap().initial_nodes = vec![
+            "redis://127.0.0.1:6380".into_connection_info().unwrap(),
+            "redis://127.0.0.1:6390".into_connection_info().unwrap(),
+        ];
+        core.cluster_params.write().connection_timeout = Duration::from_millis(100);
+        let result = get_random_connections_from_initial_nodes(&core, 2)
+            .await
+            .unwrap();
+        assert_eq!(result.connections.len(), 1);
+        assert_eq!(result.connections[0].0, "127.0.0.1:6390");
+        assert!(core
+            .conn_lock
+            .read()
+            .refresh_conn_state
+            .refresh_address_in_progress
+            .is_empty());
+        assert!(POISON_CONNECT_STARTED.notified().now_or_never().is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_bootstrap_attempt_does_not_spawn_routing_recovery() {
+        let _guard = gated_test_guard().await;
+        let mut core = core_with_non_idempotent_resolver();
+        Arc::get_mut(&mut core).unwrap().initial_nodes =
+            vec!["redis://127.0.0.1:6380".into_connection_info().unwrap()];
+        core.cluster_params.write().connection_timeout = Duration::from_millis(10);
+        let result = get_random_connections_from_initial_nodes(&core, 1)
+            .await
+            .unwrap();
+        assert!(result.connections.is_empty());
+        assert!(result.addresses_needing_refresh.is_empty());
+        assert!(core.seed_connections.read().entries.is_empty());
+        assert!(core
+            .conn_lock
+            .read()
+            .refresh_conn_state
+            .refresh_address_in_progress
+            .is_empty());
+        assert_eq!(Arc::strong_count(&core), 1);
+        assert!(POISON_CONNECT_STARTED.notified().now_or_never().is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_seed_queries_evict_owned_connections_without_hiding_acl_errors() {
+        for port in [6397, 6398] {
+            let mut core = core_with_resolver(Arc::new(SeedAddressResolver));
+            Arc::get_mut(&mut core).unwrap().initial_nodes =
+                vec![format!("redis://127.0.0.1:{port}")
+                    .into_connection_info()
+                    .unwrap()];
+            core.cluster_params
+                .write()
+                .refresh_topology_from_initial_nodes = true;
+            let result = calculate_topology_from_random_nodes(
+                &core,
+                1,
+                0,
+                SlotRefreshTrigger::RuntimeRefresh,
+            )
+            .await;
+            assert!(result.topology_result.is_err());
+            if port == 6398 {
+                assert_eq!(
+                    result.topology_result.unwrap_err().kind(),
+                    ErrorKind::PermissionDenied
+                );
+            }
+            assert!(result.failed_connections.unwrap().is_empty());
+            assert!(core.seed_connections.read().entries.is_empty());
+            assert!(core
+                .conn_lock
+                .read()
+                .refresh_conn_state
+                .refresh_address_in_progress
+                .is_empty());
+        }
     }
 
     fn core_with_mixed_initial_recovery() -> Arc<InnerCore<RecordingConnection>> {
@@ -6409,6 +7177,7 @@ pub(super) mod refresh_task_resolution_tests {
                 "redis://127.0.0.2:6379".into_connection_info().unwrap(),
             ],
             glide_connection_options: GlideConnectionOptions::default(),
+            seed_connections: Default::default(),
             topology_refresh_lock: tokio::sync::Mutex::new(()),
         })
     }
@@ -6417,31 +7186,25 @@ pub(super) mod refresh_task_resolution_tests {
     async fn mixed_initial_node_recovery_resolves_raw_failure_before_installing() {
         let core = core_with_mixed_initial_recovery();
         assert!(!ClusterConnInner::check_for_topology_diff(core.clone()).await);
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let (raw_exists, ready_exists) = {
-                    let connections = core.conn_lock.read();
-                    (
-                        connections
-                            .connection_for_address("127.0.0.2:6379")
-                            .is_some(),
-                        connections
-                            .connection_for_address("127.0.0.2:6382")
-                            .is_some(),
-                    )
-                };
-                assert!(
-                    !raw_exists,
-                    "raw initial seed was installed without resolution"
-                );
-                if ready_exists {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("resolved recovery connection should be installed");
+        assert!(core
+            .conn_lock
+            .read()
+            .connection_for_address("127.0.0.2:6379")
+            .is_none());
+        assert!(core
+            .conn_lock
+            .read()
+            .connection_for_address("127.0.0.2:6382")
+            .is_none());
+        let connection = core
+            .seed_connections
+            .read()
+            .entries
+            .get("127.0.0.2:6379")
+            .unwrap()
+            .connection
+            .clone();
+        assert_eq!(connection.await.port, 6382);
     }
 
     #[tokio::test]
@@ -6916,6 +7679,7 @@ pub(super) mod refresh_task_resolution_tests {
             ),
             initial_nodes: vec!["redis://127.0.0.1:6379".parse().unwrap()],
             glide_connection_options: GlideConnectionOptions::default(),
+            seed_connections: Default::default(),
             topology_refresh_lock: tokio::sync::Mutex::new(()),
         });
 
@@ -6924,27 +7688,25 @@ pub(super) mod refresh_task_resolution_tests {
             .expect("initial recovery should succeed");
         assert_eq!(RESOLVER_CALLS.load(Ordering::SeqCst), 1);
         assert!(!result.connections.is_empty());
-        let node = core
-            .conn_lock
+        let connection = core
+            .seed_connections
             .read()
-            .node_for_address("127.0.0.1:6390")
-            .expect("resolved final address should be the connection-map key");
+            .entries
+            .get("127.0.0.1:6379")
+            .expect("resolved final address should be cached for the original seed")
+            .connection
+            .clone();
         assert!(core
             .conn_lock
             .read()
             .node_for_address("127.0.0.1:6379")
             .is_none());
-        assert_eq!(node.user_connection.conn.await.port, 6390);
-        assert_eq!(
-            node.management_connection
-                .as_ref()
-                .expect("management connection should be installed")
-                .conn
-                .clone()
-                .await
-                .port,
-            6390
-        );
+        assert!(core
+            .conn_lock
+            .read()
+            .node_for_address("127.0.0.1:6390")
+            .is_none());
+        assert_eq!(connection.await.port, 6390);
     }
 
     fn get_connection_by_specific_route(

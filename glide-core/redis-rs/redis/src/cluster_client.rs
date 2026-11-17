@@ -578,8 +578,13 @@ impl ClusterClientBuilder {
 
     /// Enables refreshing the cluster topology from seed nodes.
     ///
-    /// When enabled, the client will periodically query the seed nodes (the nodes provided when
-    /// creating the client) to update its internal view of the cluster topology.
+    /// When enabled, topology discovery prefers the seed nodes provided when
+    /// creating the client, falling back to existing cluster connections when no
+    /// seed connection is available. A configured address resolver is applied to
+    /// each selected original seed before DNS or connection reuse. Prepared
+    /// targets are not resolved again. Discovery is asynchronous, not an atomic
+    /// cutover or a guarantee of a fixed cutover deadline.
+    /// Topology permission errors are propagated without falling back to other nodes.
     pub fn refresh_topology_from_initial_nodes(
         mut self,
         refresh_topology_from_initial_nodes: bool,

@@ -1193,6 +1193,43 @@ public class ConnectionTests {
 
     @Test
     @SneakyThrows
+    public void test_address_resolver_cluster_seed_is_resolved_during_periodic_refresh() {
+        String[] actualHostParts = CLUSTER_HOSTS[0].split(":");
+        String managedHost = "managed-cluster.invalid";
+        AtomicInteger seedResolutions = new AtomicInteger();
+        AddressResolver resolver =
+                (host, port) -> {
+                    if (managedHost.equals(host)) {
+                        seedResolutions.incrementAndGet();
+                        return new ResolvedAddress(actualHostParts[0], Integer.parseInt(actualHostParts[1]));
+                    }
+                    return new ResolvedAddress(host, port);
+                };
+        try (GlideClusterClient client =
+                GlideClusterClient.createClient(
+                                GlideClusterClientConfiguration.builder()
+                                        .address(NodeAddress.builder().host(managedHost).port(6379).build())
+                                        .addressResolver(resolver)
+                                        .advancedConfiguration(
+                                                AdvancedGlideClusterClientConfiguration.builder()
+                                                        .refreshTopologyFromInitialNodes(true)
+                                                        .periodicChecks(
+                                                                PeriodicChecksManualInterval.builder().durationInSec(1).build())
+                                                        .build())
+                                        .build())
+                        .get()) {
+            int initialResolutions = seedResolutions.get();
+            Instant deadline = Instant.now().plusSeconds(5);
+            while (seedResolutions.get() == initialResolutions && Instant.now().isBefore(deadline)) {
+                Thread.sleep(25);
+            }
+            assertTrue(seedResolutions.get() > initialResolutions);
+            assertEquals("PONG", client.ping().get());
+        }
+    }
+
+    @Test
+    @SneakyThrows
     public void test_address_resolver_cluster_client_throws_exception() {
         // Get the actual server address from test configuration
         String[] actualHostParts = CLUSTER_HOSTS[0].split(":");

@@ -2807,7 +2807,9 @@ async fn create_cluster_client(
                 tls_mode,
                 valkey_connection_info.clone(),
                 tls_params.clone(),
-                address_resolver.as_ref(),
+                // Keep the configured seed identity. The cluster engine prepares
+                // it at connect/discovery time, including resolver-aware TLS.
+                None,
             )
         })
         .collect();
@@ -2879,7 +2881,7 @@ async fn create_cluster_client(
 
     builder = builder.tcp_nodelay(request.tcp_nodelay);
 
-    // Pass the address resolver to the builder for use during topology refresh
+    // The engine owns address preparation for startup, discovery, and recovery.
     if let Some(resolver) = address_resolver.clone() {
         builder = builder.address_resolver(resolver);
     }

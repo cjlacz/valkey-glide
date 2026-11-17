@@ -29,11 +29,18 @@ import lombok.experimental.SuperBuilder;
 public class AdvancedGlideClusterClientConfiguration extends AdvancedBaseClientConfiguration {
 
     /**
-     * Enables refreshing the cluster topology using only the initial nodes.
+     * Enables refreshing the cluster topology preferentially from the initial nodes.
      *
      * <p>When this option is enabled, all topology updates (both the periodic checks and on-demand
-     * refreshes triggered by topology changes) will query only the initial nodes provided when
-     * creating the client, rather than using the internal cluster view.
+     * refreshes triggered by topology changes) prefer the initial nodes provided when creating the
+     * client. If no seed connection is available, discovery falls back to existing cluster
+     * connections. Topology permission errors are propagated without fallback.
+     *
+     * <p>When an {@link AddressResolver} is configured, seed-based discovery re-evaluates the
+     * selected original seed host and port through that resolver before DNS or connection reuse.
+     * Connections can be reused while their prepared identity and DNS peer remain current. Changes
+     * are discovered asynchronously; this option does not guarantee an atomic switch or a fixed
+     * cutover deadline.
      *
      * <p>If not set, defaults to {@code false} (uses internal cluster view for topology refresh).
      */

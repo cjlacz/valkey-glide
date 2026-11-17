@@ -61,6 +61,34 @@ To run [DNS tests](tests/test_dns.rs) locally:
 
 If the environment variable is not set, DNS tests will be skipped.
 
+### Custom-resolver seed refresh tests
+
+`tests/test_seed_refresh.rs` exercises the outer core constructor and periodic
+seed discovery with two independent, healthy clusters. A switchable resolver
+changes a synthetic seed's target A → B → A; fixed-target observers verify writes
+across all three primary-slot partitions. The matrix covers RESP2/RESP3, verified
+TLS (the synthetic seed is deliberately absent from the certificate SANs), and a
+refresh-disabled observation control.
+
+```bash
+cargo test --locked --features proto --test test_seed_refresh -- --test-threads=1
+```
+
+The harness starts and stops its own servers and generates its own test CA. It
+needs no external DNS or hosts-file changes. It tests callback translation, not
+authoritative DNS propagation. Cutover polling allows for the existing topology
+refresh throttle; its timeout is a test bound, not a public cutover guarantee.
+
+The engine's `refresh_task_resolution_tests` also verify that custom resolution
+precedes DNS and that bootstrap management connections survive topology
+validation without entering the routable node map. Bootstrap aliases reuse their
+own verified connections even when topology advertises a different hostname.
+The cache also rechecks DNS for unchanged prepared hostnames. With a finite
+connection timeout, seed attempts share one discovery deadline. Aliases for the
+same endpoint share one connection and one topology vote. Optional connection
+naming does not require extra ACL permissions, while topology-command permission
+errors still propagate.
+
 ### RDMA Tests
 
 RDMA is opt-in at build time through the `rdma` feature. `libfabric` 2.4 or newer is

@@ -170,6 +170,28 @@ where
     }
 }
 
+pub(super) async fn connect_seed_management<C>(
+    address: &ReadyToDialAddress,
+    params: ClusterParams,
+    socket_addr: SocketAddr,
+    mut options: GlideConnectionOptions,
+) -> RedisResult<ConnectionFuture<C>>
+where
+    C: ConnectionLike + Connect + Send + Sync + Clone + 'static,
+{
+    options.push_sender = None;
+    let mut connection =
+        create_connection::<C>(address, params, Some(socket_addr), true, options).await?;
+    if let Err(error) = setup_management_connection(&mut connection.conn).await {
+        // Naming is optional, just as when ordinary management setup falls back
+        // to the user connection. Authentication and topology ACL errors are not.
+        if error.kind() != ErrorKind::PermissionDenied {
+            return Err(error);
+        }
+    }
+    Ok(connection.into_future().conn)
+}
+
 async fn connect_and_check_only_management_conn<C>(
     addr: &ReadyToDialAddress,
     params: ClusterParams,
