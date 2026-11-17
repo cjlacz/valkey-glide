@@ -42,6 +42,10 @@ pub struct ConnectionRequest {
     pub inflight_requests_limit: Option<u32>,
     pub recovery_requests_queue_size: Option<u32>,
     pub lazy_connect: bool,
+    /// Prefer selected original seeds for topology discovery, re-evaluating their
+    /// custom address resolution before DNS or connection reuse. Falls back to
+    /// existing cluster connections when no seed connection is available.
+    /// Topology permission errors are propagated without fallback.
     pub refresh_topology_from_initial_nodes: bool,
     pub root_certs: Vec<Vec<u8>>,
     pub client_cert: Vec<u8>,
